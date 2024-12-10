@@ -1,4 +1,3 @@
-
 #include "comm_manager.h"
 #include "core.h"
 #include "message.h"
@@ -528,47 +527,123 @@ static void cast_uint32_to_uint16(const uint32_t* src, uint16_t* dst, size_t len
     }
 }
 
+// static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length) {
+//     size_t i = 0;
+
+//     // Process 8 float elements at a time
+//     for (; i + 8 < length; i += 8) {
+//         // Load 8 float values
+//         __m256 vec = _mm256_loadu_ps(src + i);
+
+//         // Cast to 8 half-precision float values using _mm256_cvtps_ph
+//         __m128i result = _mm256_cvtps_ph(vec, 0);
+
+//         // Store the result to the destination
+//         _mm_storeu_si128((__m128i*)(dst + i), result);
+//     }
+
+//     // Handle any remaining elements
+//     for (; i < length; i++) {
+//         dst[i] = src[i];
+//     }
+// }
+
+// Function to scale gradients, cast to fp16, and handle NaN/inf cases
 static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length) {
     size_t i = 0;
+    float scale = 2.0f; // Replace this with your scaling factor
 
-    // Process 8 float elements at a time
-    for (; i + 8 < length; i += 8) {
+    // Scale the input gradients
+    for (; i + 8 <= length; i += 8) {
         // Load 8 float values
         __m256 vec = _mm256_loadu_ps(src + i);
 
-        // Cast to 8 half-precision float values using _mm256_cvtps_ph
+        // Scale the values
+        vec = _mm256_mul_ps(vec, _mm256_set1_ps(scale));
+
+        // Handle NaN/infinite values: replace with zero
+        __m256 is_finite_mask = _mm256_cmp_ps(vec, vec, _CMP_ORD_Q);
+        vec = _mm256_blendv_ps(_mm256_setzero_ps(), vec, is_finite_mask);
+
+        // Cast to 8 half-precision float values
         __m128i result = _mm256_cvtps_ph(vec, 0);
 
         // Store the result to the destination
         _mm_storeu_si128((__m128i*)(dst + i), result);
     }
 
-    // Handle any remaining elements
+    // Handle remaining elements
+    // for (; i < length; i++) {
+    //     float scaled_value = src[i] * scale;
+    //     if (!is_finite(scaled_value)) {
+    //         scaled_value = 0.0f; // Replace NaN/inf with zero
+    //     }
+    //     // Cast to fp16 (using a hypothetical function `float_to_fp16`)
+    //     dst[i] = float_to_fp16(scaled_value); // Replace this with your fp32 to fp16 conversion function
+    // }
     for (; i < length; i++) {
         dst[i] = src[i];
     }
 }
 
+// static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length) {
+//     size_t i = 0;
+
+//     // Process 8 __fp16 elements at a time
+//     for (; i + 8 < length; i += 8) {
+//         // Load 8 __fp16 values
+//         __m128i vec = _mm_loadu_si128((const __m128i*)(src + i));
+
+//         // Cast to 8 float values using _mm256_cvtph_ps
+//         __m256 result = _mm256_cvtph_ps(vec);
+
+//         // Store the result to the destination
+//         _mm256_storeu_ps(dst + i, result);
+//     }
+
+//     // Handle any remaining elements
+//     for (; i < length; i++) {
+//         dst[i] = src[i];
+//     }
+// }
+
+// Function to unscale gradients, cast to fp32, and handle NaN/inf cases
 static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length) {
     size_t i = 0;
+    float inv_scale = 1.0f / 2.0f; // Replace this with your inverse scaling factor
 
-    // Process 8 __fp16 elements at a time
-    for (; i + 8 < length; i += 8) {
-        // Load 8 __fp16 values
+    for (; i + 8 <= length; i += 8) {
+        // Load 8 fp16 values
         __m128i vec = _mm_loadu_si128((const __m128i*)(src + i));
 
-        // Cast to 8 float values using _mm256_cvtph_ps
+        // Cast to 8 float values
         __m256 result = _mm256_cvtph_ps(vec);
+
+        // Unscale the values
+        result = _mm256_mul_ps(result, _mm256_set1_ps(inv_scale));
+
+        // Handle NaN/infinite values: replace with zero
+        __m256 is_finite_mask = _mm256_cmp_ps(result, result, _CMP_ORD_Q);
+        result = _mm256_blendv_ps(_mm256_setzero_ps(), result, is_finite_mask);
 
         // Store the result to the destination
         _mm256_storeu_ps(dst + i, result);
     }
 
-    // Handle any remaining elements
+    // Handle remaining elements
+    // for (; i < length; i++) {
+    //     float value = fp16_to_float(src[i]); // Replace this with your fp16 to fp32 conversion function
+    //     value *= inv_scale;
+    //     if (!is_finite(value)) {
+    //         value = 0.0f; // Replace NaN/inf with zero
+    //     }
+    //     dst[i] = value;
+    // }
     for (; i < length; i++) {
         dst[i] = src[i];
     }
 }
+
 #if PRIORITY_TX
 void CommManager::queueTx(const TrainTaskV2 *task, const uint32_t *ptr_grad_idx, const float *ptr_grad_val, unsigned iter) {
     uint16_t *ptr_grad_idx_16 = nullptr;
@@ -1075,3 +1150,6 @@ RecvModelSpec CommManager::recvInitmodel(std::string skey) {
 
     return spec;
 }
+
+
+

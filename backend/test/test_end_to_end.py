@@ -114,7 +114,7 @@ if __name__ == "__main__":
     parser.add_argument('--momentum', type=float, default=0.9)
 
     # dataset configs
-    parser.add_argument('--imagenet-root', type=str, default='/datasets/imagenet')
+    parser.add_argument('--imagenet-root', type=str, default='/datasets/imagenet100')
     parser.add_argument('--cifar100-root', type=str, default='/datasets/cifar100')
     parser.add_argument('--cifar10-root', type=str, default='/datasets/cifar10')
     parser.add_argument('--dataset', type=str, default='imagenet100', choices=['imagenet', 'imagenet100', 'cifar100', 'cifar10', 'dummy'])

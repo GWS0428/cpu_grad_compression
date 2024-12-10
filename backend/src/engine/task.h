@@ -147,6 +147,7 @@ public:
     uint32_t *compressed_grad_idx_ptr_;
     size_t tensor_numel_;
     int64_t tensor_compressed_numel_;
+    float scaling_factor_;
     
     std::chrono::steady_clock::time_point grad_sync_start_;
 

@@ -482,6 +482,45 @@ void CommManager::waitClientConnect() const {
     }
 }
 
+/* helper functions */
+// function to check for NaN/inf across a vector
+static inline bool has_nan_or_inf(__m256 vec) {
+    __m256 cmp = _mm256_cmp_ps(vec, vec, _CMP_ORD_Q); // Check for ordered comparison (true if not NaN)
+    int mask = _mm256_movemask_ps(cmp);
+    return mask != 0xFF; // If any bit is not set, there's a NaN/inf
+}
+
+// Function to zero out an array using AVX
+static inline void zero_out_avx_fp32(float* dst, size_t length) {
+    size_t i = 0;
+    __m256 zero_vec = _mm256_setzero_ps(); // AVX vector filled with zeros
+
+    // Zero out 8 elements at a time
+    for (; i + 8 <= length; i += 8) {
+        _mm256_storeu_ps(dst + i, zero_vec);
+    }
+
+    // Zero out remaining elements
+    for (; i < length; i++) {
+        dst[i] = 0.0f;
+    }
+}
+
+static inline void zero_out_avx_fp16(fp16_t* dst, size_t length) {
+    size_t i = 0;
+    __m256i zero_vec = _mm256_setzero_si256(); // AVX vector filled with zeros
+
+    // Zero out 16 fp16 elements at a time (16 * 16-bit = 256-bit)
+    for (; i + 16 <= length; i += 16) {
+        _mm256_storeu_si256((__m256i*)(dst + i), zero_vec);
+    }
+
+    // Zero out remaining elements
+    for (; i < length; i++) {
+        dst[i] = 0;
+    }
+}
+
 
 static void cast_uint16_to_uint32(const uint16_t* src, uint32_t* dst, size_t length) {
     size_t i = 0;
@@ -549,21 +588,22 @@ static void cast_uint32_to_uint16(const uint32_t* src, uint16_t* dst, size_t len
 // }
 
 // Function to scale gradients, cast to fp16, and handle NaN/inf cases
-static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length) {
+static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length, float scaling_factor) {
     size_t i = 0;
-    float scale = 2.0f; // Replace this with your scaling factor
+    bool invalid_values_found = false;
 
-    // Scale the input gradients
     for (; i + 8 <= length; i += 8) {
         // Load 8 float values
         __m256 vec = _mm256_loadu_ps(src + i);
 
         // Scale the values
-        vec = _mm256_mul_ps(vec, _mm256_set1_ps(scale));
+        vec = _mm256_mul_ps(vec, _mm256_set1_ps(scaling_factor));
 
-        // Handle NaN/infinite values: replace with zero
-        __m256 is_finite_mask = _mm256_cmp_ps(vec, vec, _CMP_ORD_Q);
-        vec = _mm256_blendv_ps(_mm256_setzero_ps(), vec, is_finite_mask);
+        // Check for NaN/infinite values
+        if (has_nan_or_inf(vec)) {
+            invalid_values_found = true;
+            break; // Exit the loop early
+        }
 
         // Cast to 8 half-precision float values
         __m128i result = _mm256_cvtps_ph(vec, 0);
@@ -572,18 +612,30 @@ static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length) {
         _mm_storeu_si128((__m128i*)(dst + i), result);
     }
 
-    // Handle remaining elements
-    // for (; i < length; i++) {
-    //     float scaled_value = src[i] * scale;
-    //     if (!is_finite(scaled_value)) {
-    //         scaled_value = 0.0f; // Replace NaN/inf with zero
-    //     }
-    //     // Cast to fp16 (using a hypothetical function `float_to_fp16`)
-    //     dst[i] = float_to_fp16(scaled_value); // Replace this with your fp32 to fp16 conversion function
-    // }
-    for (; i < length; i++) {
-        dst[i] = src[i];
+    // If NaN/inf is detected, set all gradients to zero and halve the scaling factor
+    if (invalid_values_found) {
+        zero_out_avx_fp16(dst, length); // Zero out destination using AVX
+        scaling_factor /= 2.0f;         // Halve the scaling factor
+        return;
     }
+
+    // Handle remaining elements
+    for (; i < length; i++) {
+        float scaled_value = src[i] * scaling_factor;
+        if (!isfinite(scaled_value)) {
+            invalid_values_found = true;
+            break;
+        } else {
+            dst[i] = (fp16_t)(scaled_value); // Replace with a proper fp32 -> fp16 conversion
+        }
+    }
+
+    // If everything is valid, double the scaling factor
+    if (!invalid_values_found) {
+        scaling_factor *= 2.0f;
+    }
+
+    return scaling_factor;
 }
 
 // static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length) {
@@ -608,9 +660,10 @@ static void cast_fp32_to_fp16(const float* src, fp16_t* dst, size_t length) {
 // }
 
 // Function to unscale gradients, cast to fp32, and handle NaN/inf cases
-static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length) {
+static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length, float scaling_factor) {
     size_t i = 0;
-    float inv_scale = 1.0f / 2.0f; // Replace this with your inverse scaling factor
+    bool invalid_values_found = false;
+    float inv_scale = 1.0f / scaling_factor;
 
     for (; i + 8 <= length; i += 8) {
         // Load 8 fp16 values
@@ -622,26 +675,41 @@ static void cast_fp16_to_fp32(const fp16_t* src, float* dst, size_t length) {
         // Unscale the values
         result = _mm256_mul_ps(result, _mm256_set1_ps(inv_scale));
 
-        // Handle NaN/infinite values: replace with zero
-        __m256 is_finite_mask = _mm256_cmp_ps(result, result, _CMP_ORD_Q);
-        result = _mm256_blendv_ps(_mm256_setzero_ps(), result, is_finite_mask);
+        // Check for NaN/infinite values
+        if (has_nan_or_inf(result)) {
+            invalid_values_found = true;
+            break; // Exit early if NaN/inf detected
+        }
 
         // Store the result to the destination
         _mm256_storeu_ps(dst + i, result);
     }
 
-    // Handle remaining elements
-    // for (; i < length; i++) {
-    //     float value = fp16_to_float(src[i]); // Replace this with your fp16 to fp32 conversion function
-    //     value *= inv_scale;
-    //     if (!is_finite(value)) {
-    //         value = 0.0f; // Replace NaN/inf with zero
-    //     }
-    //     dst[i] = value;
-    // }
-    for (; i < length; i++) {
-        dst[i] = src[i];
+    // If NaN/inf is detected, set all gradients to zero and halve the scaling factor
+    if (invalid_values_found) {
+        zero_out_avx_fp32(dst, length); // Zero out destination using AVX
+        scaling_factor /= 2.0f;         // Halve the scaling factor
+        return;
     }
+
+    // Handle remaining elements
+    for (; i < length; i++) {
+        float value = (float)(src[i]); // Replace with fp16 -> fp32 conversion
+        value *= inv_scale;
+        if (!isfinite(value)) {
+            invalid_values_found = true;
+            break;
+        } else {
+            dst[i] = value;
+        }
+    }
+
+    // If everything is valid, double the scaling factor
+    // if (!invalid_values_found) {
+    //     scaling_factor *= 2.0f;
+    // }
+
+    return scaling_factor;
 }
 
 #if PRIORITY_TX
@@ -649,6 +717,7 @@ void CommManager::queueTx(const TrainTaskV2 *task, const uint32_t *ptr_grad_idx,
     uint16_t *ptr_grad_idx_16 = nullptr;
     fp16_t *ptr_grad_val_16 = nullptr;
     uint8_t flag = 0;
+    int scaling_factor = 1;
 
 #if IDX_COMPRESSION
     if (task->tensor_numel_ < 65536) {
@@ -660,7 +729,9 @@ void CommManager::queueTx(const TrainTaskV2 *task, const uint32_t *ptr_grad_idx,
 
 #if FP16_COMPRESSION
     ptr_grad_val_16 = new fp16_t[task->tensor_compressed_numel_];
-    cast_fp32_to_fp16(ptr_grad_val, ptr_grad_val_16, task->tensor_compressed_numel_);
+    scaling_factor = task->scaling_factor_;
+    float scaling_factor = cast_fp32_to_fp16(ptr_grad_val, ptr_grad_val_16, task->tensor_compressed_numel_);
+    task->scaling_factor_ = scaling_factor;
     flag |= COMM_FLAG_FP16_VAL;
 #endif
 

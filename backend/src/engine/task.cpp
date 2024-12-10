@@ -35,6 +35,7 @@ TrainTaskV2::TrainTaskV2(unsigned iter_cnt, int layer, const std::string key_str
     : valid_(true), state_(TASK_INITIALIZED), barrier_id_(0), barrier_id_future_(0), 
     tensor_numel_(0), 
     tensor_compressed_numel_(0), 
+    scaling_factor_(2.0f),
     grad_sync_iter_(0),
     compressed_grad_val_ptr_(nullptr),
     compressed_grad_idx_ptr_(nullptr),
